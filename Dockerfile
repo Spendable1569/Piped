@@ -14,6 +14,7 @@ ARG TARGETARCH
 RUN --mount=type=cache,id=pnpm-store-${TARGETARCH},target=/root/.local/share/pnpm \
     --mount=type=cache,id=node-modules-${TARGETARCH},target=/app/node_modules \
     export QEMU_CPU=max && \
+    export DISABLE_ESLINT=1 && \
     pnpm install --prefer-offline && \
     pnpm build && ./localizefonts.sh
 
