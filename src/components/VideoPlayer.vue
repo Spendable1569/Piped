@@ -12,6 +12,7 @@
             :autoplay="shouldAutoPlay"
             :loop="selectedAutoLoop"
             playsinline
+            :controls="useHlsJs"
         />
         <button
             v-if="inSegment"
@@ -78,7 +79,7 @@ import {
     getPreferenceString,
     setPreference,
 } from "@/composables/usePreferences.js";
-const shakaImport = import("shaka-player/dist/shaka-player.ui.js");
+
 const hotkeysImport = import("hotkeys-js");
 
 const route = useRoute();
@@ -118,6 +119,7 @@ const showCurrentVolume = ref(false);
 let hideCurrentVolumeTimeout = null;
 const playbackSpeedInput = ref(null);
 const error = ref(0);
+const wasDeactivated = ref(false); // New: tracks if component was deactivated
 
 let shakaLib = null;
 let playerInstance = null;
@@ -125,11 +127,19 @@ let uiInstance = null;
 let hotkeysLib = null;
 let shakaPromise = null;
 let hotkeysPromise = null;
+let hlsLib = null;
+let hlsInstance = null;
+let hlsPromise = null;
 let lastSelectedTextTrack = null;
 let thumbnailVttUrl = null;
+let activePlayer = null; // 'shaka' or 'hls'
 
 const shouldAutoPlay = computed(() => {
     return getPreferenceBoolean("playerAutoPlay", true) && !props.isEmbed;
+});
+
+const useHlsJs = computed(() => {
+    return getPreferenceString("hlsPlayer", "shaka") === "hlsjs";
 });
 
 const preferredVideoCodecs = computed(() => {
@@ -165,7 +175,11 @@ function skipSegment(el, segment) {
 
 function adjustPlaybackSpeed(newSpeed) {
     const normalizedSpeed = Math.min(4, Math.max(0.25, newSpeed));
-    playerInstance.trickPlay(normalizedSpeed);
+    if (activePlayer === "hls") {
+        videoEl.value.playbackRate = normalizedSpeed;
+    } else if (activePlayer === "shaka" && playerInstance) {
+        playerInstance.trickPlay(normalizedSpeed);
+    }
     if (hideCurrentSpeedTimeout) window.clearTimeout(hideCurrentSpeedTimeout);
     showCurrentSpeed.value = false;
     showCurrentSpeed.value = true;
@@ -192,36 +206,77 @@ function setSpeedFromInput() {
 }
 
 function getActiveTextTrack() {
-    return playerInstance?.getTextTracks()?.find(track => track.active) ?? null;
+    if (activePlayer === "hls") {
+        const tracks = videoEl.value.textTracks;
+        for (let i = 0; i < tracks.length; i++) {
+            if (tracks[i].mode === "showing") return tracks[i];
+        }
+        return null;
+    } else if (activePlayer === "shaka") {
+        return playerInstance?.getTextTracks()?.find(track => track.active) ?? null;
+    }
+    return null;
 }
 
 function selectTextTrack(track) {
-    playerInstance.selectTextTrack(track ?? null);
-    if (track) {
-        lastSelectedTextTrack = track;
+    if (activePlayer === "hls") {
+        const tracks = videoEl.value.textTracks;
+        for (let i = 0; i < tracks.length; i++) {
+            tracks[i].mode = track && tracks[i] === track ? "showing" : "hidden";
+        }
+        if (track) {
+            lastSelectedTextTrack = track;
+        }
+        return;
+    } else if (activePlayer === "shaka") {
+        playerInstance.selectTextTrack(track ?? null);
+        if (track) {
+            lastSelectedTextTrack = track;
+        }
     }
 }
 
 function applyPreferredTextTrack() {
-    const textTracks = playerInstance.getTextTracks();
-    const prefSubtitles = getPreferenceString("subtitles", "");
-    const autoDisplayCaptions = getPreferenceBoolean("autoDisplayCaptions", false);
+    if (activePlayer === "hls") {
+        const textTracks = Array.from(videoEl.value.textTracks);
+        const prefSubtitles = getPreferenceString("subtitles", "");
+        const autoDisplayCaptions = getPreferenceBoolean("autoDisplayCaptions", false);
 
-    let selectedTrack = null;
+        let selectedTrack = null;
 
-    if (prefSubtitles !== "") {
-        selectedTrack = textTracks.find(textTrack => textTrack.language == prefSubtitles) ?? null;
+        if (prefSubtitles !== "") {
+            selectedTrack = textTracks.find(textTrack => textTrack.language == prefSubtitles) ?? null;
+        }
+
+        if (!selectedTrack && autoDisplayCaptions) {
+            const prefLang = getPreferenceString("hl", "en").substr(0, 2);
+            selectedTrack = textTracks.find(textTrack => textTrack.language == prefLang) ?? textTracks[0] ?? null;
+        }
+
+        selectTextTrack(selectedTrack);
+        return;
+    } else if (activePlayer === "shaka") {
+        const textTracks = playerInstance.getTextTracks();
+        const prefSubtitles = getPreferenceString("subtitles", "");
+        const autoDisplayCaptions = getPreferenceBoolean("autoDisplayCaptions", false);
+
+        let selectedTrack = null;
+
+        if (prefSubtitles !== "") {
+            selectedTrack = textTracks.find(textTrack => textTrack.language == prefSubtitles) ?? null;
+        }
+
+        if (!selectedTrack && autoDisplayCaptions) {
+            const prefLang = getPreferenceString("hl", "en").substr(0, 2);
+            selectedTrack = textTracks.find(textTrack => textTrack.language == prefLang) ?? textTracks[0] ?? null;
+        }
+
+        selectTextTrack(selectedTrack);
     }
-
-    if (!selectedTrack && autoDisplayCaptions) {
-        const prefLang = getPreferenceString("hl", "en").substr(0, 2);
-        selectedTrack = textTracks.find(textTrack => textTrack.language == prefLang) ?? textTracks[0] ?? null;
-    }
-
-    selectTextTrack(selectedTrack);
 }
 
 function updateMarkers() {
+    if (activePlayer !== "shaka") return;
     const markers = container.value.querySelector(".shaka-ad-markers");
     const array = ["to right"];
     props.sponsors?.segments?.forEach(segment => {
@@ -256,10 +311,9 @@ function updateMarkers() {
 }
 
 function updateSponsors() {
-    if (getPreferenceBoolean("showMarkers", true)) {
-        shakaPromise.then(() => {
-            updateMarkers();
-        });
+    if (getPreferenceBoolean("showMarkers", true) && activePlayer === "shaka") {
+        if (shakaLib) updateMarkers();
+        else shakaPromise?.then(() => updateMarkers());
     }
 }
 
@@ -269,6 +323,7 @@ function updateSponsors() {
 // overlay instead of on .shaka-seek-bar, a 40px-tall <input> whose background
 // would render the markers at the input's full touch-target height.
 function updateChapterMarkers() {
+    if (activePlayer !== "shaka") return;
     const markers = container.value.querySelector(".shaka-chapter-markers");
     if (!markers) return;
 
@@ -339,6 +394,7 @@ function buildThumbnailVtt(framePage) {
 }
 
 async function setupThumbnailTrack() {
+    if (activePlayer !== "shaka") return;
     const framePage = getPreviewFramePage();
     if (!framePage?.urls?.length) return;
 
@@ -375,11 +431,71 @@ function seek(time) {
     }
 }
 
-async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
-    const url = "/watch?v=" + props.video.id;
+async function loadShaka(uri, mime) {
+    // Destroy any existing HLS instance
+    if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+    }
+    if (activePlayer === "hls") activePlayer = null;
+
+    // Import Shaka if not already loaded
+    if (!shakaPromise) {
+        shakaPromise = import("shaka-player/dist/shaka-player.ui.js")
+            .then(shaka => shaka.default)
+            .then(shaka => {
+                shakaLib = shaka;
+                return shaka;
+            });
+    }
+    const shaka = await shakaPromise;
+    shakaLib = shaka;
+
+    const el = videoEl.value;
+    // Clean up any previous Shaka UI
+    if (uiInstance) {
+        uiInstance.destroy();
+        uiInstance = null;
+        playerInstance = null;
+    }
+
+    shaka.polyfill.installAll();
+    const localPlayer = new shaka.Player();
+    await localPlayer.attach(el);
+
+    const proxyURL = new URL(props.video.proxyUrl);
+    let proxyPath = proxyURL.pathname;
+    if (proxyPath.lastIndexOf("/") === proxyPath.length - 1) {
+        proxyPath = proxyPath.substring(0, proxyPath.length - 1);
+    }
+
+    localPlayer.getNetworkingEngine().registerRequestFilter((_type, request) => {
+        const uri = request.uris[0];
+        var url = new URL(uri);
+        const headers = request.headers;
+        if (
+            url.host.endsWith(".googlevideo.com") ||
+            (url.host.endsWith(".lbryplayer.xyz") && (getPreferenceBoolean("proxyLBRY", false) || headers.Range))
+        ) {
+            url.searchParams.set("host", url.host);
+            url.protocol = proxyURL.protocol;
+            url.host = proxyURL.host;
+            url.pathname = proxyPath + url.pathname;
+            request.uris[0] = url.toString();
+        }
+        if (url.pathname === proxyPath + "/videoplayback") {
+            if (headers.Range) {
+                url.searchParams.set("range", headers.Range.split("=")[1]);
+                request.headers = {};
+                request.uris[0] = url.toString();
+            }
+        }
+    });
+
+    localPlayer.configure("streaming.bufferingGoal", Math.max(getPreferenceNumber("bufferGoal", 10), 10));
+    localPlayer.configure("streaming.bufferBehind", 300);
 
     if (!uiInstance) {
-        destroy();
         const OpenButton = class extends shaka.ui.Element {
             constructor(parent, controls) {
                 super(parent, controls);
@@ -406,7 +522,7 @@ async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
 
                 this.eventManager.listen(this.newTabButton_, "click", () => {
                     this.video.pause();
-                    window.open(url);
+                    window.open("/watch?v=" + props.video.id);
                 });
             }
         };
@@ -439,15 +555,10 @@ async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
         uiInstance.configure(config);
     }
 
-    updateMarkers();
-
-    const event = new Event("playerInit");
-    window.dispatchEvent(event);
-
     playerInstance = localPlayer;
+    activePlayer = "shaka";
 
     const disableVideo = getPreferenceBoolean("listen", false) && !props.video.livestream;
-
     const prefetchLimit = Math.min(Math.max(getPreferenceNumber("prefetchLimit", 2), 0), 10);
 
     playerInstance.configure({
@@ -495,99 +606,247 @@ async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
         });
     }
 
-    playerInstance
-        .load(uri, null, mime)
-        .then(async () => {
-            // Player.load()'s startTime arg does not reliably perform the
-            // initial seek; apply it here. See shaka-project/shaka-player#6241.
-            if (startTime > 0) {
-                el.currentTime = startTime;
-                await new Promise(resolve => el.addEventListener("seeked", resolve, { once: true }));
-            }
-            initialSeekComplete.value = true;
-            let lang = "en";
-            const prefLang = getPreferenceString("hl", "en").substr(0, 2);
-            const audioTracks = playerInstance.getAudioTracks();
-            const audioLanguages = [...new Set(audioTracks.map(t => t.language))];
-            if (audioLanguages.includes(prefLang)) lang = prefLang;
-            const selectedTrack = audioTracks.find(t => t.language === lang);
-            if (selectedTrack) playerInstance.selectAudioTrack(selectedTrack);
+    try {
+        await playerInstance.load(uri, null, mime);
 
-            if (audioLanguages.length > 1) {
-                const overflowMenuButtons = uiInstance.getConfiguration().overflowMenuButtons;
-                const newOverflowMenuButtons = [
-                    ...overflowMenuButtons.slice(0, 1),
-                    "language",
-                    ...overflowMenuButtons.slice(1),
-                ];
-                uiInstance.configure("overflowMenuButtons", newOverflowMenuButtons);
-            }
+        if (startTime > 0) {
+            el.currentTime = startTime;
+            await new Promise(resolve => el.addEventListener("seeked", resolve, { once: true }));
+        }
+        initialSeekComplete.value = true;
 
-            if (qualityConds) {
-                var leastDiff = Number.MAX_VALUE;
-                var bestStream = null;
+        let lang = "en";
+        const prefLang = getPreferenceString("hl", "en").substr(0, 2);
+        const audioTracks = playerInstance.getAudioTracks();
+        const audioLanguages = [...new Set(audioTracks.map(t => t.language))];
+        if (audioLanguages.includes(prefLang)) lang = prefLang;
+        const selectedTrack = audioTracks.find(t => t.language === lang);
+        if (selectedTrack) playerInstance.selectAudioTrack(selectedTrack);
 
-                var bestAudio = 0;
+        if (audioLanguages.length > 1) {
+            const overflowMenuButtons = uiInstance.getConfiguration().overflowMenuButtons;
+            const newOverflowMenuButtons = [
+                ...overflowMenuButtons.slice(0, 1),
+                "language",
+                ...overflowMenuButtons.slice(1),
+            ];
+            uiInstance.configure("overflowMenuButtons", newOverflowMenuButtons);
+        }
 
-                const tracks = playerInstance
-                    .getVariantTracks()
-                    .filter(track => track.language == lang || track.language == "und");
+        if (qualityConds) {
+            var leastDiff = Number.MAX_VALUE;
+            var bestStream = null;
+            var bestAudio = 0;
 
-                if (quality >= 480)
-                    tracks.forEach(track => {
-                        const audioBandwidth = track.audioBandwidth;
-                        if (audioBandwidth > bestAudio) bestAudio = audioBandwidth;
-                    });
+            const tracks = playerInstance
+                .getVariantTracks()
+                .filter(track => track.language == lang || track.language == "und");
 
-                tracks
-                    .sort((a, b) => a.bandwidth - b.bandwidth)
-                    .forEach(stream => {
-                        if (stream.audioBandwidth < bestAudio) return;
+            if (quality >= 480)
+                tracks.forEach(track => {
+                    const audioBandwidth = track.audioBandwidth;
+                    if (audioBandwidth > bestAudio) bestAudio = audioBandwidth;
+                });
 
-                        const diff = Math.abs(quality - stream.height);
-                        if (diff < leastDiff) {
-                            leastDiff = diff;
-                            bestStream = stream;
-                        }
-                    });
+            tracks
+                .sort((a, b) => a.bandwidth - b.bandwidth)
+                .forEach(stream => {
+                    if (stream.audioBandwidth < bestAudio) return;
 
-                playerInstance.selectVariantTrack(bestStream, true);
-            }
+                    const diff = Math.abs(quality - stream.height);
+                    if (diff < leastDiff) {
+                        leastDiff = diff;
+                        bestStream = stream;
+                    }
+                });
 
-            await Promise.all(
-                props.video.subtitles.map(subtitle => {
-                    return playerInstance.addTextTrackAsync(
-                        subtitle.url,
-                        subtitle.code,
-                        "subtitles",
-                        subtitle.mimeType,
-                        null,
-                        subtitle.name,
-                    );
-                }),
-            );
-            el.volume = getPreferenceNumber("volume", 1);
-            const rate = getPreferenceNumber("rate", 1);
-            el.playbackRate = rate;
-            el.defaultPlaybackRate = rate;
+            playerInstance.selectVariantTrack(bestStream, true);
+        }
 
-            applyPreferredTextTrack();
-            await setupThumbnailTrack();
-        })
-        .catch(e => {
-            console.error(e);
-            error.value = e.code;
-        });
+        await Promise.all(
+            props.video.subtitles.map(subtitle => {
+                return playerInstance.addTextTrackAsync(
+                    subtitle.url,
+                    subtitle.code,
+                    "subtitles",
+                    subtitle.mimeType,
+                    null,
+                    subtitle.name,
+                );
+            }),
+        );
+        el.volume = getPreferenceNumber("volume", 1);
+        const rate = getPreferenceNumber("rate", 1);
+        el.playbackRate = rate;
+        el.defaultPlaybackRate = rate;
+
+        applyPreferredTextTrack();
+        await setupThumbnailTrack();
+    } catch (e) {
+        console.error(e);
+        error.value = e.code;
+    }
 
     if (route.query.fullscreen === "true" && !uiInstance.getControls().isFullScreenEnabled())
         uiInstance.getControls().toggleFullScreen();
 
-    const seekbar = container.value.querySelector(".shaka-seek-bar");
     updateChapterMarkers();
 
-    seekbar.addEventListener("mouseup", () => {
-        videoEl.value.focus();
+    const seekbar = container.value.querySelector(".shaka-seek-bar");
+    if (seekbar) {
+        seekbar.addEventListener("mouseup", () => {
+            videoEl.value.focus();
+        });
+    }
+}
+
+async function loadHls(uri) {
+    // Destroy any existing Shaka instance
+    if (uiInstance) {
+        uiInstance.destroy();
+        uiInstance = null;
+        playerInstance = null;
+    }
+    if (playerInstance) {
+        playerInstance.destroy();
+        playerInstance = null;
+    }
+    if (activePlayer === "shaka") activePlayer = null;
+
+    // Import Hls.js if not already loaded
+    if (!hlsPromise) {
+        hlsPromise = import("hls.js")
+            .then(mod => mod.default)
+            .then(hls => {
+                hlsLib = hls;
+                return hls;
+            });
+    }
+    hlsLib = await hlsPromise;
+
+    const el = videoEl.value;
+    // Clean up existing HLS instance
+    if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+    }
+
+    // Remove any existing subtitle tracks
+    while (el.firstChild) {
+        el.removeChild(el.firstChild);
+    }
+
+    el.setAttribute("poster", props.video.thumbnailUrl);
+
+    hlsInstance = new hlsLib({});
+    hlsInstance.attachMedia(el);
+
+    hlsInstance.on(hlsLib.Events.MEDIA_ATTACHED, () => {
+        hlsInstance.loadSource(uri);
     });
+
+    hlsInstance.on(hlsLib.Events.MANIFEST_PARSED, async () => {
+        const time = route.query.t ?? route.query.start;
+        let startTime = 0;
+
+        if (time) {
+            startTime = parseTimeParam(time);
+        } else if (window.db && getPreferenceBoolean("watchHistory", false)) {
+            await new Promise(resolve => {
+                var tx = window.db.transaction("watch_history", "readonly");
+                var store = tx.objectStore("watch_history");
+                var request = store.get(props.video.id);
+                request.onsuccess = function (event) {
+                    var video = event.target.result;
+                    const currentTime = video?.currentTime;
+                    if (currentTime) {
+                        if (currentTime < video.duration * 0.9) {
+                            startTime = currentTime;
+                        }
+                    }
+                    resolve();
+                };
+            });
+        }
+
+        if (startTime > 0) {
+            el.currentTime = startTime;
+            await new Promise(resolve => el.addEventListener("seeked", resolve, { once: true }));
+        }
+        initialSeekComplete.value = true;
+
+        el.volume = getPreferenceNumber("volume", 1);
+        const rate = getPreferenceNumber("rate", 1);
+        el.playbackRate = rate;
+        el.defaultPlaybackRate = rate;
+
+        const quality = getPreferenceNumber("quality", 0);
+        if (quality > 0 && hlsInstance.levels.length > 0) {
+            let bestLevelIndex = -1;
+            let leastDiff = Number.MAX_VALUE;
+
+            hlsInstance.levels.forEach((level, index) => {
+                if (!level.height) return; // skip audio-only or undefined heights
+                const diff = Math.abs(quality - level.height);
+                if (diff < leastDiff) {
+                    leastDiff = diff;
+                    bestLevelIndex = index;
+                }
+            });
+
+            if (bestLevelIndex !== -1) {
+                // Setting currentLevel to a specific index automatically disables auto level switching
+                hlsInstance.currentLevel = bestLevelIndex;
+            }
+        }
+
+        // Select audio track based on UI language preference
+        const prefLang = getPreferenceString("hl", "en").substr(0, 2);
+        const audioTracks = hlsInstance.audioTracks || [];
+        if (audioTracks.length > 0) {
+            // Try to find a track matching the preferred language
+            let selectedTrack = audioTracks.find(track => track.lang === prefLang);
+            // Fallback to English
+            if (!selectedTrack) {
+                selectedTrack = audioTracks.find(track => track.lang === "en");
+            }
+            // Fallback to the first available track
+            if (!selectedTrack) {
+                selectedTrack = audioTracks[0];
+            }
+            // Apply the selection
+            if (selectedTrack) {
+                hlsInstance.audioTrack = selectedTrack.id;
+            }
+        }
+
+        props.video.subtitles.forEach(subtitle => {
+            const track = document.createElement("track");
+            track.kind = "subtitles";
+            track.label = subtitle.name;
+            track.srclang = subtitle.code;
+            track.src = subtitle.url;
+            el.appendChild(track);
+        });
+
+        el.addEventListener(
+            "loadedmetadata",
+            () => {
+                applyPreferredTextTrack();
+            },
+            { once: true },
+        );
+    });
+
+    hlsInstance.on(hlsLib.Events.ERROR, (event, data) => {
+        if (data.fatal) {
+            console.error("HLS.js fatal error:", data);
+            error.value = data.type;
+            hlsInstance.destroy();
+        }
+    });
+
+    activePlayer = "hls";
 }
 
 async function loadVideo() {
@@ -598,6 +857,18 @@ async function loadVideo() {
     const el = videoEl.value;
 
     el.setAttribute("poster", props.video.thumbnailUrl);
+
+    const shouldUseHls = useHlsJs.value && (props.video.livestream || props.video.hls);
+
+    if (shouldUseHls) {
+        const hlsUrl = props.video.hls;
+        if (!hlsUrl) {
+            console.error("HLS source not found");
+            return;
+        }
+        await loadHls(hlsUrl);
+        return;
+    }
 
     const noPrevPlayer = !playerInstance;
 
@@ -669,49 +940,7 @@ async function loadVideo() {
         mime = "video/mp4";
     }
 
-    if (noPrevPlayer)
-        shakaPromise.then(async () => {
-            if (destroying.value) return;
-            shakaLib.polyfill.installAll();
-
-            const localPlayer = new shakaLib.Player();
-            await localPlayer.attach(el);
-            const proxyURL = new URL(props.video.proxyUrl);
-            let proxyPath = proxyURL.pathname;
-            if (proxyPath.lastIndexOf("/") === proxyPath.length - 1) {
-                proxyPath = proxyPath.substring(0, proxyPath.length - 1);
-            }
-
-            localPlayer.getNetworkingEngine().registerRequestFilter((_type, request) => {
-                const uri = request.uris[0];
-                var url = new URL(uri);
-                const headers = request.headers;
-                if (
-                    url.host.endsWith(".googlevideo.com") ||
-                    (url.host.endsWith(".lbryplayer.xyz") &&
-                        (getPreferenceBoolean("proxyLBRY", false) || headers.Range))
-                ) {
-                    url.searchParams.set("host", url.host);
-                    url.protocol = proxyURL.protocol;
-                    url.host = proxyURL.host;
-                    url.pathname = proxyPath + url.pathname;
-                    request.uris[0] = url.toString();
-                }
-                if (url.pathname === proxyPath + "/videoplayback") {
-                    if (headers.Range) {
-                        url.searchParams.set("range", headers.Range.split("=")[1]);
-                        request.headers = {};
-                        request.uris[0] = url.toString();
-                    }
-                }
-            });
-
-            localPlayer.configure("streaming.bufferingGoal", Math.max(getPreferenceNumber("bufferGoal", 10), 10));
-            localPlayer.configure("streaming.bufferBehind", 300);
-
-            setPlayerAttrs(localPlayer, el, uri, mime, shakaLib);
-        });
-    else setPlayerAttrs(playerInstance, el, uri, mime, shakaLib);
+    await loadShaka(uri, mime);
 
     if (noPrevPlayer) {
         el.addEventListener("loadeddata", () => {
@@ -751,6 +980,10 @@ function destroy(hotkeys) {
         URL.revokeObjectURL(thumbnailVttUrl);
         thumbnailVttUrl = null;
     }
+    if (hlsInstance) {
+        hlsInstance.destroy();
+        hlsInstance = null;
+    }
     if (uiInstance && !document.pictureInPictureElement) {
         uiInstance.destroy();
         uiInstance = undefined;
@@ -762,10 +995,10 @@ function destroy(hotkeys) {
     }
     if (hotkeys) hotkeysLib?.unbind();
     container.value?.querySelectorAll("div").forEach(node => node.remove());
+    activePlayer = null;
 }
 
 onMounted(() => {
-    if (!shakaLib) shakaPromise = shakaImport.then(shaka => shaka.default).then(shaka => (shakaLib = shaka));
     if (!hotkeysLib) hotkeysPromise = hotkeysImport.then(mod => mod.default).then(hk => (hotkeysLib = hk));
 });
 
@@ -779,7 +1012,15 @@ onActivated(() => {
                 const el = videoEl.value;
                 switch (handler.key) {
                     case "f":
-                        uiInstance.getControls().toggleFullScreen();
+                        if (activePlayer === "hls") {
+                            if (document.fullscreenElement) {
+                                document.exitFullscreen();
+                            } else {
+                                el.parentElement.requestFullscreen();
+                            }
+                        } else if (activePlayer === "shaka" && uiInstance) {
+                            uiInstance.getControls().toggleFullScreen();
+                        }
                         e.preventDefault();
                         break;
                     case "m":
@@ -797,11 +1038,15 @@ onActivated(() => {
                     case "c":
                         if (getActiveTextTrack()) {
                             lastSelectedTextTrack = getActiveTextTrack();
-                            playerInstance.selectTextTrack(null);
+                            selectTextTrack(null);
                         } else if (lastSelectedTextTrack) {
-                            playerInstance.selectTextTrack(lastSelectedTextTrack);
+                            selectTextTrack(lastSelectedTextTrack);
                         } else {
-                            selectTextTrack(playerInstance.getTextTracks()[0] ?? null);
+                            const tracks =
+                                activePlayer === "hls"
+                                    ? Array.from(el.textTracks)
+                                    : (playerInstance?.getTextTracks() ?? []);
+                            selectTextTrack(tracks[0] ?? null);
                         }
                         e.preventDefault();
                         break;
@@ -919,10 +1164,17 @@ onActivated(() => {
             },
         );
     });
+
+    // Re‑initialize player if the component was previously deactivated
+    if (wasDeactivated.value) {
+        wasDeactivated.value = false;
+        loadVideo();
+    }
 });
 
 onDeactivated(() => {
     destroying.value = true;
+    wasDeactivated.value = true;
     destroy(true);
 });
 
@@ -936,7 +1188,15 @@ defineExpose({
     seek,
     destroy,
     updateSponsors,
-    isFullScreenEnabled: () => uiInstance?.getControls()?.isFullScreenEnabled(),
+    isFullScreenEnabled: () => {
+        if (activePlayer === "hls") {
+            return document.fullscreenElement != null;
+        }
+        if (activePlayer === "shaka" && uiInstance) {
+            return uiInstance.getControls().isFullScreenEnabled();
+        }
+        return false;
+    },
 });
 </script>
 
