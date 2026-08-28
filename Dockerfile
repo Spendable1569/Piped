@@ -10,8 +10,10 @@ COPY . .
 
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
+ARG TARGETARCH
 RUN --mount=type=cache,id=pnpm-store-${TARGETARCH},target=/root/.local/share/pnpm \
     --mount=type=cache,id=node-modules-${TARGETARCH},target=/app/node_modules \
+    export QEMU_CPU=max && \
     pnpm install --prefer-offline && \
     pnpm build && ./localizefonts.sh
 
