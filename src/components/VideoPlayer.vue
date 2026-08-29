@@ -12,7 +12,7 @@
             :autoplay="shouldAutoPlay"
             :loop="selectedAutoLoop"
             playsinline
-            :controls="useHlsJs"
+            :controls="isHlsActive"
         />
         <button
             v-if="inSegment"
@@ -133,6 +133,7 @@ let hlsPromise = null;
 let lastSelectedTextTrack = null;
 let thumbnailVttUrl = null;
 let activePlayer = null; // 'shaka' or 'hls'
+const isHlsActive = ref(false);
 
 const shouldAutoPlay = computed(() => {
     return getPreferenceBoolean("playerAutoPlay", true) && !props.isEmbed;
@@ -557,6 +558,7 @@ async function loadShaka(uri, mime) {
 
     playerInstance = localPlayer;
     activePlayer = "shaka";
+    isHlsActive.value = false;
 
     const disableVideo = getPreferenceBoolean("listen", false) && !props.video.livestream;
     const prefetchLimit = Math.min(Math.max(getPreferenceNumber("prefetchLimit", 2), 0), 10);
@@ -780,6 +782,140 @@ async function loadHls(uri) {
         el.playbackRate = rate;
         el.defaultPlaybackRate = rate;
 
+        // Filter levels by preferred video codecs
+        // Map preferred codec families to the prefixes used in HLS manifests
+        const codecPrefixMap = {
+            vp9: "vp09",
+            avc1: "avc1",
+            av01: "av01",
+        };
+        const allowedPrefixes = preferredVideoCodecs.value.map(codec => codecPrefixMap[codec] || codec);
+
+        if (allowedPrefixes.length > 0) {
+            // Iterate backwards to safely remove levels
+            for (let i = hlsInstance.levels.length - 1; i >= 0; i--) {
+                const level = hlsInstance.levels[i];
+                const videoCodec = level.videoCodec || "";
+                const isAllowed = allowedPrefixes.some(prefix => videoCodec.startsWith(prefix));
+                if (!isAllowed) {
+                    hlsInstance.removeLevel(i);
+                }
+            }
+        }
+
+        // ------------------------------
+        // Filter levels by resolution, frame rate, and HDR (PQ)
+        // ------------------------------
+        function getVideoRange(level) {
+            if (level.attrs && level.attrs["VIDEO-RANGE"]) return level.attrs["VIDEO-RANGE"];
+            if (level._attrs && level._attrs.length > 0 && level._attrs[0]["VIDEO-RANGE"])
+                return level._attrs[0]["VIDEO-RANGE"];
+            return null;
+        }
+
+        function filterHlsLevelsByResolutionAndFrameRate() {
+            const levels = hlsInstance.levels;
+            if (!levels || levels.length === 0) return;
+
+            // Group indices by resolution
+            const resMap = new Map(); // key: "WxH", value: array of indices
+            for (let i = 0; i < levels.length; i++) {
+                const level = levels[i];
+                if (level.width && level.height) {
+                    const key = `${level.width}x${level.height}`;
+                    if (!resMap.has(key)) resMap.set(key, []);
+                    resMap.get(key).push(i);
+                }
+            }
+
+            const indicesToRemove = new Set();
+
+            // Step 1: keep only highest frame rate per resolution
+            for (const [, indices] of resMap.entries()) {
+                if (indices.length <= 1) continue;
+                let maxFrameRate = 0;
+                for (const idx of indices) {
+                    const fr = levels[idx].frameRate || 0;
+                    if (fr > maxFrameRate) maxFrameRate = fr;
+                }
+                if (maxFrameRate === 0) continue; // cannot determine, skip
+                for (const idx of indices) {
+                    const fr = levels[idx].frameRate || 0;
+                    if (fr < maxFrameRate) indicesToRemove.add(idx);
+                }
+            }
+
+            if (indicesToRemove.size > 0) {
+                const sorted = Array.from(indicesToRemove).sort((a, b) => b - a);
+                for (const idx of sorted) hlsInstance.removeLevel(idx);
+            }
+
+            // Re‑group remaining levels for HDR check
+            const newLevels = hlsInstance.levels;
+            const resMap2 = new Map();
+            for (let i = 0; i < newLevels.length; i++) {
+                const level = newLevels[i];
+                if (level.width && level.height) {
+                    const key = `${level.width}x${level.height}`;
+                    if (!resMap2.has(key)) resMap2.set(key, []);
+                    resMap2.get(key).push(i);
+                }
+            }
+
+            // Step 2: if still multiple per resolution, prefer HDR (PQ)
+            const indicesToRemove2 = new Set();
+            for (const [, indices] of resMap2.entries()) {
+                if (indices.length <= 1) continue;
+                const hasHDR = indices.some(idx => getVideoRange(newLevels[idx]) === "PQ");
+                if (hasHDR) {
+                    for (const idx of indices) {
+                        if (getVideoRange(newLevels[idx]) !== "PQ") indicesToRemove2.add(idx);
+                    }
+                }
+            }
+
+            if (indicesToRemove2.size > 0) {
+                const sorted2 = Array.from(indicesToRemove2).sort((a, b) => b - a);
+                for (const idx of sorted2) hlsInstance.removeLevel(idx);
+            }
+
+            // Step 3: if still multiple per resolution, keep only levels with audio group "234" (if any exist)
+            const levelsAfterStep2 = hlsInstance.levels;
+            const resMap3 = new Map();
+            for (let i = 0; i < levelsAfterStep2.length; i++) {
+                const level = levelsAfterStep2[i];
+                if (level.width && level.height) {
+                    const key = `${level.width}x${level.height}`;
+                    if (!resMap3.has(key)) resMap3.set(key, []);
+                    resMap3.get(key).push(i);
+                }
+            }
+
+            const indicesToRemove3 = new Set();
+            for (const [, indices] of resMap3.entries()) {
+                if (indices.length <= 1) continue;
+                const hasAudio234 = indices.some(idx => {
+                    const level = levelsAfterStep2[idx];
+                    return level._audioGroups && level._audioGroups.includes("234");
+                });
+                if (hasAudio234) {
+                    for (const idx of indices) {
+                        const level = levelsAfterStep2[idx];
+                        if (!(level._audioGroups && level._audioGroups.includes("234"))) {
+                            indicesToRemove3.add(idx);
+                        }
+                    }
+                }
+            }
+
+            if (indicesToRemove3.size > 0) {
+                const sorted3 = Array.from(indicesToRemove3).sort((a, b) => b - a);
+                for (const idx of sorted3) hlsInstance.removeLevel(idx);
+            }
+        }
+
+        filterHlsLevelsByResolutionAndFrameRate();
+
         const quality = getPreferenceNumber("quality", 0);
         if (quality > 0 && hlsInstance.levels.length > 0) {
             let bestLevelIndex = -1;
@@ -806,9 +942,15 @@ async function loadHls(uri) {
         if (audioTracks.length > 0) {
             // Try to find a track matching the preferred language
             let selectedTrack = audioTracks.find(track => track.lang === prefLang);
+            if (!selectedTrack) {
+                selectedTrack = audioTracks.find(track => track.lang.startsWith(prefLang));
+            }
             // Fallback to English
             if (!selectedTrack) {
                 selectedTrack = audioTracks.find(track => track.lang === "en");
+            }
+            if (!selectedTrack) {
+                selectedTrack = audioTracks.find(track => track.lang.startsWith("en"));
             }
             // Fallback to the first available track
             if (!selectedTrack) {
@@ -847,6 +989,7 @@ async function loadHls(uri) {
     });
 
     activePlayer = "hls";
+    isHlsActive.value = true;
 }
 
 async function loadVideo() {
@@ -858,7 +1001,26 @@ async function loadVideo() {
 
     el.setAttribute("poster", props.video.thumbnailUrl);
 
-    const shouldUseHls = useHlsJs.value && (props.video.livestream || props.video.hls);
+    let shouldUseHls = false;
+    if (useHlsJs.value) {
+        if (props.video.livestream) {
+            // Livestreams rely on HLS; use hls.js if selected
+            shouldUseHls = true;
+        } else {
+            const preferHls = getPreferenceBoolean("preferHls", false);
+            if (preferHls) {
+                // Prefer HLS: use hls.js whenever an HLS source exists
+                shouldUseHls = !!props.video.hls;
+            } else {
+                // Use hls.js only if HLS is the sole available source
+                const hasDash = !!props.video.dash;
+                const hasOtherStreams =
+                    (props.video.audioStreams && props.video.audioStreams.length > 0) ||
+                    (props.video.videoStreams && props.video.videoStreams.length > 0);
+                shouldUseHls = !!props.video.hls && !hasDash && !hasOtherStreams;
+            }
+        }
+    }
 
     if (shouldUseHls) {
         const hlsUrl = props.video.hls;
