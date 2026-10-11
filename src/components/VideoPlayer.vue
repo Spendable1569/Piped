@@ -78,7 +78,6 @@ import {
     getPreferenceString,
     setPreference,
 } from "@/composables/usePreferences.js";
-const shakaImport = import("shaka-player/dist/shaka-player.ui.js");
 const hotkeysImport = import("hotkeys-js");
 
 const route = useRoute();
@@ -119,11 +118,10 @@ let hideCurrentVolumeTimeout = null;
 const playbackSpeedInput = ref(null);
 const error = ref(0);
 
-let shakaLib = null;
+let shakaLib = window.shaka;
 let playerInstance = null;
 let uiInstance = null;
 let hotkeysLib = null;
-let shakaPromise = null;
 let hotkeysPromise = null;
 let lastSelectedTextTrack = null;
 let thumbnailVttUrl = null;
@@ -257,9 +255,7 @@ function updateMarkers() {
 
 function updateSponsors() {
     if (getPreferenceBoolean("showMarkers", true)) {
-        shakaPromise.then(() => {
-            updateMarkers();
-        });
+        updateMarkers();
     }
 }
 
@@ -669,49 +665,46 @@ async function loadVideo() {
         mime = "video/mp4";
     }
 
-    if (noPrevPlayer)
-        shakaPromise.then(async () => {
-            if (destroying.value) return;
-            shakaLib.polyfill.installAll();
+    if (noPrevPlayer) {
+        if (destroying.value) return;
+        shakaLib.polyfill.installAll();
 
-            const localPlayer = new shakaLib.Player();
-            await localPlayer.attach(el);
-            const proxyURL = new URL(props.video.proxyUrl);
-            let proxyPath = proxyURL.pathname;
-            if (proxyPath.lastIndexOf("/") === proxyPath.length - 1) {
-                proxyPath = proxyPath.substring(0, proxyPath.length - 1);
+        const localPlayer = new shakaLib.Player();
+        await localPlayer.attach(el);
+        const proxyURL = new URL(props.video.proxyUrl);
+        let proxyPath = proxyURL.pathname;
+        if (proxyPath.lastIndexOf("/") === proxyPath.length - 1) {
+            proxyPath = proxyPath.substring(0, proxyPath.length - 1);
+        }
+
+        localPlayer.getNetworkingEngine().registerRequestFilter((_type, request) => {
+            const uri = request.uris[0];
+            var url = new URL(uri);
+            const headers = request.headers;
+            if (
+                url.host.endsWith(".googlevideo.com") ||
+                (url.host.endsWith(".lbryplayer.xyz") && (getPreferenceBoolean("proxyLBRY", false) || headers.Range))
+            ) {
+                url.searchParams.set("host", url.host);
+                url.protocol = proxyURL.protocol;
+                url.host = proxyURL.host;
+                url.pathname = proxyPath + url.pathname;
+                request.uris[0] = url.toString();
             }
-
-            localPlayer.getNetworkingEngine().registerRequestFilter((_type, request) => {
-                const uri = request.uris[0];
-                var url = new URL(uri);
-                const headers = request.headers;
-                if (
-                    url.host.endsWith(".googlevideo.com") ||
-                    (url.host.endsWith(".lbryplayer.xyz") &&
-                        (getPreferenceBoolean("proxyLBRY", false) || headers.Range))
-                ) {
-                    url.searchParams.set("host", url.host);
-                    url.protocol = proxyURL.protocol;
-                    url.host = proxyURL.host;
-                    url.pathname = proxyPath + url.pathname;
+            if (url.pathname === proxyPath + "/videoplayback") {
+                if (headers.Range) {
+                    url.searchParams.set("range", headers.Range.split("=")[1]);
+                    request.headers = {};
                     request.uris[0] = url.toString();
                 }
-                if (url.pathname === proxyPath + "/videoplayback") {
-                    if (headers.Range) {
-                        url.searchParams.set("range", headers.Range.split("=")[1]);
-                        request.headers = {};
-                        request.uris[0] = url.toString();
-                    }
-                }
-            });
-
-            localPlayer.configure("streaming.bufferingGoal", Math.max(getPreferenceNumber("bufferGoal", 10), 10));
-            localPlayer.configure("streaming.bufferBehind", 300);
-
-            setPlayerAttrs(localPlayer, el, uri, mime, shakaLib);
+            }
         });
-    else setPlayerAttrs(playerInstance, el, uri, mime, shakaLib);
+
+        localPlayer.configure("streaming.bufferingGoal", Math.max(getPreferenceNumber("bufferGoal", 10), 10));
+        localPlayer.configure("streaming.bufferBehind", 300);
+
+        setPlayerAttrs(localPlayer, el, uri, mime, shakaLib);
+    } else setPlayerAttrs(playerInstance, el, uri, mime, shakaLib);
 
     if (noPrevPlayer) {
         el.addEventListener("loadeddata", () => {
@@ -765,7 +758,6 @@ function destroy(hotkeys) {
 }
 
 onMounted(() => {
-    if (!shakaLib) shakaPromise = shakaImport.then(shaka => shaka.default).then(shaka => (shakaLib = shaka));
     if (!hotkeysLib) hotkeysPromise = hotkeysImport.then(mod => mod.default).then(hk => (hotkeysLib = hk));
 });
 
