@@ -125,6 +125,7 @@ let hotkeysLib = null;
 let hotkeysPromise = null;
 let lastSelectedTextTrack = null;
 let thumbnailVttUrl = null;
+let safariCaptionListenerController = null;
 
 const shouldAutoPlay = computed(() => {
     return getPreferenceBoolean("playerAutoPlay", true) && !props.isEmbed;
@@ -605,13 +606,40 @@ async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
             el.playbackRate = rate;
             el.defaultPlaybackRate = rate;
 
-            // Safari HLS if selectTextTrack applied too early, it selects the wrong caption
             if (navigator.vendor === "Apple Computer, Inc." && mime === "application/x-mpegURL") {
-                const onFirstLoad = () => {
-                    el.removeEventListener("loadedmetadata", onFirstLoad);
+                // Safari HLS if selectTextTrack applied too early, it selects the wrong caption
+                (async () => {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                    if (destroying.value) return;
                     applyPreferredTextTrack();
-                };
-                el.addEventListener("loadedmetadata", onFirstLoad);
+                })();
+                // iOS Safari overrides the caption track when entering fullscreen or
+                // picture-in-picture: remember the current status, then apply it back
+                // once Safari has actually changed it.
+                safariCaptionListenerController?.abort();
+                safariCaptionListenerController = new AbortController();
+                el.addEventListener(
+                    "webkitpresentationmodechanged",
+                    async () => {
+                        const mode = el.webkitPresentationMode;
+                        if (mode !== "fullscreen" && mode !== "picture-in-picture") return;
+                        const track = getActiveTextTrack();
+                        // Safari changes the track right after the mode change, so wait
+                        // for that change instead of guessing a delay.
+                        await new Promise(resolve => {
+                            const done = () => {
+                                clearTimeout(fallback);
+                                playerInstance?.removeEventListener("textchanged", done);
+                                resolve();
+                            };
+                            const fallback = setTimeout(done, 1000);
+                            playerInstance?.addEventListener("textchanged", done);
+                        });
+                        if (destroying.value) return;
+                        selectTextTrack(track);
+                    },
+                    { signal: safariCaptionListenerController.signal },
+                );
             } else {
                 applyPreferredTextTrack();
             }
@@ -787,6 +815,8 @@ async function loadVideo() {
 }
 
 function destroy(hotkeys) {
+    // Later, to destroy:
+    safariCaptionListenerController?.abort();
     if (thumbnailVttUrl) {
         URL.revokeObjectURL(thumbnailVttUrl);
         thumbnailVttUrl = null;
