@@ -455,6 +455,7 @@ async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
             },
             textTrackLabelFormat: shaka.ui.Overlay.TrackLabelFormat.LABEL,
             trackLabelFormat: shaka.ui.Overlay.TrackLabelFormat.LABEL,
+            enableFullscreenOnRotation: true,
         };
 
         uiInstance.configure(config);
