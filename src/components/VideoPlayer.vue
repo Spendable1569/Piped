@@ -624,17 +624,7 @@ async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
                         const mode = el.webkitPresentationMode;
                         if (mode !== "fullscreen" && mode !== "picture-in-picture") return;
                         const track = getActiveTextTrack();
-                        // Safari changes the track right after the mode change, so wait
-                        // for that change instead of guessing a delay.
-                        await new Promise(resolve => {
-                            const done = () => {
-                                clearTimeout(fallback);
-                                playerInstance?.removeEventListener("textchanged", done);
-                                resolve();
-                            };
-                            const fallback = setTimeout(done, 1000);
-                            playerInstance?.addEventListener("textchanged", done);
-                        });
+                        await new Promise(resolve => setTimeout(resolve, 1000));
                         if (destroying.value) return;
                         selectTextTrack(track);
                     },
