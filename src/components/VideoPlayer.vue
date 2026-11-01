@@ -605,7 +605,16 @@ async function setPlayerAttrs(localPlayer, el, uri, mime, shaka) {
             el.playbackRate = rate;
             el.defaultPlaybackRate = rate;
 
-            applyPreferredTextTrack();
+            // Safari HLS if selectTextTrack applied too early, it selects the wrong caption
+            if (navigator.vendor === "Apple Computer, Inc." && mime === "application/x-mpegURL") {
+                const onFirstLoad = () => {
+                    el.removeEventListener("loadedmetadata", onFirstLoad);
+                    applyPreferredTextTrack();
+                };
+                el.addEventListener("loadedmetadata", onFirstLoad);
+            } else {
+                applyPreferredTextTrack();
+            }
             await setupThumbnailTrack();
         })
         .catch(e => {
