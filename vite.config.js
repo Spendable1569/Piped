@@ -11,7 +11,7 @@ import path from "path";
 import eslintPlugin from "vite-plugin-eslint";
 
 // https://vitejs.dev/config/
-export default defineConfig({
+export default defineConfig(({ command }) => ({
     plugins: [
         vue(),
         tailwindcss(),
@@ -77,7 +77,7 @@ export default defineConfig({
                 ],
             },
         }),
-        eslintPlugin(),
+        ...(command !== "build" ? [eslintPlugin()] : []),
     ],
     resolve: {
         alias: {
@@ -88,4 +88,4 @@ export default defineConfig({
         sourcemap: true,
         cssMinify: "lightningcss",
     },
-});
+}));
